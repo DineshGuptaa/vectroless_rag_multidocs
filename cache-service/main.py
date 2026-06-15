@@ -5,8 +5,25 @@ from typing import Optional, Any, Dict
 from datetime import datetime, timedelta
 import json
 import hashlib
+import os
+import logging
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="Cache Service", version="1.0.0")
+from shared.consul_discovery import ConsulRegistry
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    consul = ConsulRegistry(consul_host=os.getenv("CONSUL_HOST", "consul"))
+    port = int(os.getenv("PORT", "8006"))
+    await consul.register("cache-service", port)
+    yield
+    await consul.close()
+
+
+app = FastAPI(title="Cache Service", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

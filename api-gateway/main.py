@@ -30,16 +30,16 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
-    # Startup: Register all services
+    # Startup: Register all services (resolves URLs via Consul with fallback)
     logger.info("Starting API Gateway")
 
-    service_registry.register("documents", "http://document-service:8001", max_retries=3, timeout=60.0)
-    service_registry.register("trees", "http://tree-service:8002", max_retries=3, timeout=300.0)
-    service_registry.register("queries", "http://query-service:8003", max_retries=3, timeout=600.0)
-    service_registry.register("chat", "http://chat-service:8004", max_retries=2, timeout=180.0)
-    service_registry.register("storage", "http://storage-service:8005", max_retries=3, timeout=30.0)
-    service_registry.register("cache", "http://cache-service:8006", max_retries=2, timeout=10.0)
-    service_registry.register("settings", "http://settings-service:8007", max_retries=3, timeout=30.0)
+    await service_registry.register("documents", "http://document-service:8001", max_retries=3, timeout=60.0)
+    await service_registry.register("trees", "http://tree-service:8002", max_retries=3, timeout=300.0)
+    await service_registry.register("queries", "http://query-service:8003", max_retries=3, timeout=600.0)
+    await service_registry.register("chat", "http://chat-service:8004", max_retries=2, timeout=180.0)
+    await service_registry.register("storage", "http://storage-service:8005", max_retries=3, timeout=30.0)
+    await service_registry.register("cache", "http://cache-service:8006", max_retries=2, timeout=10.0)
+    await service_registry.register("settings", "http://settings-service:8007", max_retries=3, timeout=30.0)
 
     logger.info(f"Registered {len(service_registry.services)} services")
 

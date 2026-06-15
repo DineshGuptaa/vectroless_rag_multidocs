@@ -1,5 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+import os
+import logging
 
 from database import init_storage
 from documents import router as documents_router
@@ -7,7 +10,22 @@ from trees import router as trees_router
 from conversations import router as conversations_router
 from stats import router as stats_router
 
-app = FastAPI(title="Storage Service", version="1.0.0")
+logger = logging.getLogger(__name__)
+
+from shared.consul_discovery import ConsulRegistry
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_storage()
+    consul = ConsulRegistry(consul_host=os.getenv("CONSUL_HOST", "consul"))
+    port = int(os.getenv("PORT", "8005"))
+    await consul.register("storage-service", port)
+    yield
+    await consul.close()
+
+
+app = FastAPI(title="Storage Service", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,12 +40,6 @@ app.include_router(documents_router)
 app.include_router(trees_router)
 app.include_router(conversations_router)
 app.include_router(stats_router)
-
-
-@app.on_event("startup")
-async def startup():
-    """Initialize storage on startup"""
-    init_storage()
 
 
 @app.get("/")

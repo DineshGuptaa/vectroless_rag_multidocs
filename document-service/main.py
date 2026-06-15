@@ -2,13 +2,40 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
+from contextlib import asynccontextmanager
 import pypdf
 import httpx
 import os
 import uuid
 import docx
+import logging
 
-app = FastAPI(title="Document Service", version="1.0.0")
+from shared.consul_discovery import ConsulRegistry
+
+logger = logging.getLogger(__name__)
+
+storage_url = os.getenv("STORAGE_SERVICE_URL", "http://storage-service:8005")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global storage_url
+    consul = ConsulRegistry(consul_host=os.getenv("CONSUL_HOST", "consul"))
+    port = int(os.getenv("PORT", "8001"))
+    await consul.register("document-service", port)
+
+    resolved = await consul.get_service_url(
+        "storage-service", storage_url
+    )
+    if resolved:
+        storage_url = resolved
+        logger.info(f"Document service: resolved storage URL via Consul: {resolved}")
+
+    yield
+    await consul.close()
+
+
+app = FastAPI(title="Document Service", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -125,7 +152,7 @@ async def upload_document(file: UploadFile = File(...)):
         # Store document metadata in storage service
         async with httpx.AsyncClient() as client:
             storage_response = await client.post(
-                "http://storage-service:8005/documents",
+                f"{storage_url}/documents",
                 json={
                     "filename": file.filename,
                     "file_path": file_path,
@@ -162,7 +189,7 @@ async def extract_document_text(doc_id: int):
     """Extract full text from document"""
     async with httpx.AsyncClient() as client:
         # Get document from storage
-        response = await client.get(f"http://storage-service:8005/documents/{doc_id}")
+        response = await client.get(f"{storage_url}/documents/{doc_id}")
 
         if response.status_code != 200:
             raise HTTPException(status_code=404, detail="Document not found")
@@ -187,7 +214,7 @@ async def extract_document_text(doc_id: int):
 async def get_page_text(doc_id: int, page_num: int):
     """Get text from specific page"""
     async with httpx.AsyncClient() as client:
-        response = await client.get(f"http://storage-service:8005/documents/{doc_id}")
+        response = await client.get(f"{storage_url}/documents/{doc_id}")
 
         if response.status_code != 200:
             raise HTTPException(status_code=404, detail="Document not found")

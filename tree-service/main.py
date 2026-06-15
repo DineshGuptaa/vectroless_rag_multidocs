@@ -7,31 +7,47 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
+from contextlib import asynccontextmanager
 import httpx
 import logging
 import os
 from io import BytesIO
 
 from page_index import page_index_main
+from shared.consul_discovery import ConsulRegistry
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Tree Service", version="1.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Service URLs
+# Service URLs (resolved at startup via Consul, fallback to env vars / defaults)
 STORAGE_SERVICE_URL = os.getenv("STORAGE_SERVICE_URL", "http://storage-service:8005")
 SETTINGS_SERVICE_URL = os.getenv("SETTINGS_SERVICE_URL", "http://settings-service:8007")
+CHAT_SERVICE_URL = "http://chat-service:8004"
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global STORAGE_SERVICE_URL, SETTINGS_SERVICE_URL, CHAT_SERVICE_URL
+    consul = ConsulRegistry(consul_host=os.getenv("CONSUL_HOST", "consul"))
+    port = int(os.getenv("PORT", "8002"))
+    await consul.register("tree-service", port, tags=["pageindex", "llm"])
+
+    for name, attr in [("storage-service", "STORAGE_SERVICE_URL"),
+                        ("settings-service", "SETTINGS_SERVICE_URL"),
+                        ("chat-service", "CHAT_SERVICE_URL")]:
+        cur = globals()[attr]
+        resolved = await consul.get_service_url(name, cur)
+        if resolved and resolved != cur:
+            globals()[attr] = resolved
+            logger.info(f"Tree service: resolved {attr} via Consul: {resolved}")
+
+    yield
+    await consul.close()
+
+
+app = FastAPI(title="Tree Service", version="1.0.0", lifespan=lifespan)
 
 
 class TreeGenerationRequest(BaseModel):
@@ -83,7 +99,7 @@ async def generate_tree(request: TreeGenerationRequest):
         # Emit tree started event
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post("http://chat-service:8004/emit/tree-started", json={
+                await client.post(f"{CHAT_SERVICE_URL}/emit/tree-started", json={
                     "doc_id": doc_id,
                     "progress": 0,
                     "message": "Starting tree generation..."
@@ -156,7 +172,7 @@ async def generate_tree(request: TreeGenerationRequest):
         # Emit progress: Starting PageIndex algorithm
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post("http://chat-service:8004/emit/tree-progress", json={
+                await client.post(f"{CHAT_SERVICE_URL}/emit/tree-progress", json={
                     "doc_id": doc_id,
                     "progress": 30,
                     "message": "Running PageIndex algorithm..."
@@ -169,7 +185,7 @@ async def generate_tree(request: TreeGenerationRequest):
             """Emit progress updates to frontend via WebSocket"""
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
-                    await client.post("http://chat-service:8004/emit/tree-progress", json={
+                    await client.post(f"{CHAT_SERVICE_URL}/emit/tree-progress", json={
                         "doc_id": doc_id,
                         "progress": progress,
                         "message": message
@@ -186,7 +202,7 @@ async def generate_tree(request: TreeGenerationRequest):
         # Emit progress: Tree generated
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post("http://chat-service:8004/emit/tree-progress", json={
+                await client.post(f"{CHAT_SERVICE_URL}/emit/tree-progress", json={
                     "doc_id": doc_id,
                     "progress": 80,
                     "message": f"Tree generated with {result['num_nodes']} nodes",
@@ -217,7 +233,7 @@ async def generate_tree(request: TreeGenerationRequest):
         # Emit progress: Saving
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post("http://chat-service:8004/emit/tree-progress", json={
+                await client.post(f"{CHAT_SERVICE_URL}/emit/tree-progress", json={
                     "doc_id": doc_id,
                     "progress": 95,
                     "message": "Finalizing..."
@@ -235,7 +251,7 @@ async def generate_tree(request: TreeGenerationRequest):
         # Emit completion event
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post("http://chat-service:8004/emit/tree-completed", json={
+                await client.post(f"{CHAT_SERVICE_URL}/emit/tree-completed", json={
                     "doc_id": doc_id,
                     "tree_id": tree_record['id'],
                     "progress": 100,
@@ -259,7 +275,7 @@ async def generate_tree(request: TreeGenerationRequest):
         # Emit error event
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post("http://chat-service:8004/emit/tree-error", json={
+                await client.post(f"{CHAT_SERVICE_URL}/emit/tree-error", json={
                     "doc_id": doc_id,
                     "message": str(he.detail),
                     "progress": 0
@@ -272,7 +288,7 @@ async def generate_tree(request: TreeGenerationRequest):
         # Emit error event
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post("http://chat-service:8004/emit/tree-error", json={
+                await client.post(f"{CHAT_SERVICE_URL}/emit/tree-error", json={
                     "doc_id": doc_id,
                     "message": f"Tree generation failed: {str(e)}",
                     "progress": 0

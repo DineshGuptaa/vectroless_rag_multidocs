@@ -1,11 +1,13 @@
 """
-Service Client with Retry Logic and Circuit Breakers
+Service Client with Retry Logic, Circuit Breakers, and Consul-backed Discovery
 """
 import httpx
 from httpx_retries import RetryTransport, Retry
 from circuitbreaker import circuit
 from typing import Optional, Dict, Any
 import logging
+
+from shared.consul_discovery import ConsulRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +27,6 @@ class ServiceClient:
         self.base_url = base_url
         self.timeout = timeout
 
-        # Configure retry policy
         retry = Retry(
             total=max_retries,
             backoff_factor=backoff_factor,
@@ -33,17 +34,14 @@ class ServiceClient:
             allowed_methods=["GET", "POST", "PUT", "DELETE", "PATCH"]
         )
 
-        # Create transport with retry
         transport = RetryTransport(retry=retry)
 
-        # Create sync client
         self.client = httpx.Client(
             transport=transport,
             base_url=base_url,
             timeout=timeout
         )
 
-        # Create async client
         self.async_client = httpx.AsyncClient(
             transport=RetryTransport(retry=retry),
             base_url=base_url,
@@ -57,7 +55,6 @@ class ServiceClient:
 
     @circuit(failure_threshold=5, recovery_timeout=60, expected_exception=httpx.HTTPError)
     async def get(self, path: str, **kwargs) -> httpx.Response:
-        """GET request with circuit breaker"""
         try:
             logger.debug(f"[{self.service_name}] GET {path}")
             response = await self.async_client.get(path, **kwargs)
@@ -72,7 +69,6 @@ class ServiceClient:
 
     @circuit(failure_threshold=5, recovery_timeout=60, expected_exception=httpx.HTTPError)
     async def post(self, path: str, **kwargs) -> httpx.Response:
-        """POST request with circuit breaker"""
         try:
             logger.debug(f"[{self.service_name}] POST {path}")
             response = await self.async_client.post(path, **kwargs)
@@ -87,7 +83,6 @@ class ServiceClient:
 
     @circuit(failure_threshold=5, recovery_timeout=60, expected_exception=httpx.HTTPError)
     async def delete(self, path: str, **kwargs) -> httpx.Response:
-        """DELETE request with circuit breaker"""
         try:
             logger.debug(f"[{self.service_name}] DELETE {path}")
             response = await self.async_client.delete(path, **kwargs)
@@ -102,7 +97,6 @@ class ServiceClient:
 
     @circuit(failure_threshold=5, recovery_timeout=60, expected_exception=httpx.HTTPError)
     async def patch(self, path: str, **kwargs) -> httpx.Response:
-        """PATCH request with circuit breaker"""
         try:
             logger.debug(f"[{self.service_name}] PATCH {path}")
             response = await self.async_client.patch(path, **kwargs)
@@ -116,11 +110,10 @@ class ServiceClient:
             raise
 
     async def health_check(self) -> Dict[str, Any]:
-        """Health check without circuit breaker (so it doesn't trip on failures)"""
         try:
             response = await self.async_client.get(
                 "/health",
-                timeout=5.0  # Short timeout for health checks
+                timeout=5.0
             )
             if response.status_code == 200:
                 return {
@@ -154,51 +147,50 @@ class ServiceClient:
             }
 
     def close(self):
-        """Close client connections"""
         self.client.close()
 
     async def aclose(self):
-        """Close async client connections"""
         await self.async_client.aclose()
 
 
 class ServiceRegistry:
-    """Central registry for all microservice clients"""
+    """Consul-backed central registry for all microservice clients"""
 
-    def __init__(self):
+    def __init__(self, consul_host: str = "consul"):
+        self._consul = ConsulRegistry(consul_host)
         self.services: Dict[str, ServiceClient] = {}
-        logger.info("Initializing service registry")
+        logger.info("Initializing Consul-backed service registry")
 
-    def register(
+    async def register(
         self,
         name: str,
         url: str,
         max_retries: int = 3,
         timeout: float = 30.0
     ) -> ServiceClient:
-        """Register a service client"""
+        resolved = await self._consul.get_service_url(name, url)
+        if resolved != url:
+            logger.info(f"Consul resolved '{name}' -> {resolved}")
         client = ServiceClient(
             service_name=name,
-            base_url=url,
+            base_url=resolved,
             max_retries=max_retries,
             timeout=timeout
         )
         self.services[name] = client
-        logger.info(f"Registered service: {name} at {url}")
+        logger.info(f"Registered service: {name} at {resolved}")
         return client
 
     def get(self, name: str) -> Optional[ServiceClient]:
-        """Get a service client by name"""
         return self.services.get(name)
 
     async def health_check_all(self) -> Dict[str, Dict[str, Any]]:
-        """Check health of all registered services"""
         health_status = {}
         for name, client in self.services.items():
             health_status[name] = await client.health_check()
         return health_status
 
     async def close_all(self):
-        """Close all service clients"""
         for client in self.services.values():
             await client.aclose()
+        await self._consul.close()

@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
+from contextlib import asynccontextmanager
 import httpx
 import os
 import logging
@@ -11,11 +12,41 @@ import json
 import hashlib
 import asyncio
 
+from shared.consul_discovery import ConsulRegistry
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Query Service", version="1.0.0")
+# Service URLs (resolved at startup via Consul, fallback to env vars / defaults)
+STORAGE_SERVICE = os.getenv("STORAGE_SERVICE_URL", "http://storage-service:8005")
+CACHE_SERVICE = os.getenv("CACHE_SERVICE_URL", "http://cache-service:8006")
+SETTINGS_SERVICE = os.getenv("SETTINGS_SERVICE_URL", "http://settings-service:8007")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global STORAGE_SERVICE, CACHE_SERVICE, SETTINGS_SERVICE
+    consul = ConsulRegistry(consul_host=os.getenv("CONSUL_HOST", "consul"))
+    port = int(os.getenv("PORT", "8003"))
+    await consul.register("query-service", port, tags=["llm", "rag"])
+
+    for name, attr in [("storage-service", "STORAGE_SERVICE"),
+                        ("cache-service", "CACHE_SERVICE"),
+                        ("settings-service", "SETTINGS_SERVICE")]:
+        cur = globals()[attr]
+        resolved = await consul.get_service_url(name, cur)
+        if resolved and resolved != cur:
+            globals()[attr] = resolved
+            logger.info(f"Query service: resolved {attr} via Consul: {resolved}")
+
+    yield
+    await consul.close()
+
+
+app = FastAPI(title="Query Service", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,13 +55,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Service URLs
-STORAGE_SERVICE = os.getenv("STORAGE_SERVICE_URL", "http://storage-service:8005")
-CACHE_SERVICE = os.getenv("CACHE_SERVICE_URL", "http://cache-service:8006")
-SETTINGS_SERVICE = os.getenv("SETTINGS_SERVICE_URL", "http://settings-service:8007")
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 
 # Models
 class QueryRequest(BaseModel):
@@ -321,7 +345,8 @@ async def stage1_tree_search(
     question: str,
     tree: Dict[str, Any],
     api_key: str,
-    model: str
+    model: str,
+    filename: str = ""
 ) -> tuple[List[str], str, int]:
     """
     Stage 1: Tree Search (PageIndex approach)
@@ -333,37 +358,45 @@ async def stage1_tree_search(
     # Remove text fields to reduce prompt size (PageIndex approach)
     tree_without_text = remove_fields(tree.copy(), fields=['text'])
 
-    # Create search prompt (following PageIndex pattern)
-    search_prompt = f"""You are given a user request and a tree structure of a document.
-Each node contains a node id, node title, and corresponding page numbers.
-Your task is to find all nodes that are likely to contain information relevant to fulfilling the request.
+    search_prompt = f"""You are given a document tree and must find nodes likely to contain information relevant to the user's request.
 
-IMPORTANT: Look for ANY nodes whose titles or position suggest they could contain relevant information. Include all potentially relevant sections, even if the title match is partial. If the request mentions a chapter number, section, or topic, find every node that covers that subject.
+Rules:
+- Include nodes whose titles could reasonably relate to the request topic
+- For generic titles like "FAQ", "Section 1", "Introduction", "Overview", include the node if the document's filename or overall topic aligns with the request
+- If no nodes seem relevant at all, return an empty list
+- When in doubt, INCLUDE the node — the next stage will verify
 
 Request: {question}
+Document filename: {filename}
 
 Document tree structure:
 {json.dumps(tree_without_text, indent=2)}
 
-Please reply in the following JSON format:
+Reply in JSON format:
 {{
-    "thinking": "<Your reasoning on which nodes are relevant to the request>",
-    "node_list": ["node_id_1", "node_id_2", ..., "node_id_n"]
+    "thinking": "<reasoning on which nodes match>",
+    "node_list": ["node_id_1", ...]
 }}
-
-Directly return the final JSON structure. Do not output anything else."""
+Output ONLY valid JSON."""
 
     # Call LLM
     result, tokens = await call_llm(search_prompt, api_key, model, temperature=0.3, max_tokens=2000)
 
     # Parse result
     try:
-        # Extract JSON from response (handle code blocks)
         result = result.strip()
+
+        # Remove markdown code block fences if present
         if result.startswith("```"):
             lines = result.split("\n")
             json_lines = [l for l in lines if l.strip() and not l.strip().startswith("```")]
             result = "\n".join(json_lines)
+
+        # Find the first { and last } to extract clean JSON
+        start = result.find("{")
+        end = result.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            result = result[start:end+1]
 
         result_json = json.loads(result)
         node_list = result_json.get("node_list", [])
@@ -374,9 +407,9 @@ Directly return the final JSON structure. Do not output anything else."""
 
         return node_list, thinking, tokens
     except Exception as e:
-        logger.error(f"Failed to parse tree search result: {e}")
-        logger.error(f"Raw result: {result}")
-        raise HTTPException(status_code=500, detail=f"Failed to parse tree search result: {str(e)}")
+        logger.warning(f"Failed to parse tree search result: {e}")
+        logger.warning(f"Raw result (first 500): {result[:500]}")
+        return [], "", tokens
 
 async def stage2_answer_generation(
     question: str,
@@ -478,15 +511,13 @@ async def stage2_answer_generation(
     else:
         citation_instruction = "Provide a clear answer based on the context."
 
-    answer_prompt = f"""Answer the question based ONLY on the context below. Be concise and direct.
-
-Question: {question}
+    answer_prompt = f"""Read the context and answer the question. If the context doesn't have the answer, say "I cannot find this in the provided documents."
 
 Context:
 {relevant_content}
 
+Question: {question}
 {citation_instruction}
-If the context lacks the information, say "I cannot find this in the provided documents."
 
 Answer:"""
 
@@ -569,17 +600,36 @@ async def query_document(request: QueryRequest):
         else:
             doc_trees = await get_documents_with_trees()
 
-            # If query explicitly mentions a document filename, restrict to that document
-            def normalize(s: str) -> str:
-                return ''.join(c for c in s.lower() if c.isalnum())
-            query_norm = normalize(request.question)
-            matched_docs = []
+            # Pre-filter: only run Stage 1 on documents whose filename shares keywords with the question
+            STOPWORDS = {"what", "is", "the", "a", "an", "in", "of", "to", "and", "or", "for", "on", "with", "about", "does", "do", "are", "how", "why", "where", "when", "which", "who", "can", "will", "has", "have", "all", "list", "get", "tell", "show", "give", "find", "explain", "describe", "define"}
+
+            def clean_word(w: str) -> str:
+                return ''.join(c for c in w.lower() if c.isalnum())
+
+            question_words = {clean_word(w) for w in request.question.split() if clean_word(w) not in STOPWORDS and len(clean_word(w)) > 2}
+
+            def get_filename_keywords(filename: str) -> set:
+                name = os.path.splitext(filename)[0].lower()
+                words = set()
+                for part in name.replace('-', ' ').replace('_', ' ').split():
+                    part = ''.join(c for c in part if c.isalnum())
+                    if part and part not in STOPWORDS and len(part) > 2:
+                        words.add(part)
+                return words
+
+            # Soft pre-filter: narrow down to documents whose filename shares keywords with the question
+            # If no document matches, fall back to searching all (tight Stage 1 prompt prevents over-matching)
+            filtered = []
             for d in doc_trees:
-                fname_norm = normalize(os.path.splitext(d["filename"])[0])
-                if fname_norm in query_norm:
-                    matched_docs.append(d)
-            if len(matched_docs) == 1:
-                doc_trees = matched_docs
+                fname_keywords = get_filename_keywords(d["filename"])
+                if question_words and (question_words & fname_keywords):
+                    filtered.append(d)
+
+            if filtered:
+                doc_trees = filtered
+                logger.info(f"Filename filter narrowed to {len(doc_trees)} doc(s): {[d['filename'] for d in doc_trees]}")
+            else:
+                logger.info(f"No filename match — searching all {len(doc_trees)} documents")
 
             num_docs = len(doc_trees)
 
@@ -595,30 +645,47 @@ async def query_document(request: QueryRequest):
                     question=request.question,
                     tree=dt["tree"],
                     api_key=api_key,
-                    model=model
+                    model=model,
+                    filename=dt["filename"]
                 )
-                # Fallback: if Stage 1 returned no nodes, use all nodes from this doc
-                if not nl:
-                    doc_map_full = create_node_mapping(dt["tree"])
-                    nl = list(doc_map_full.keys())
-                    th = f"Fallback: using all nodes from {dt['filename']} (Stage 1 found no specific matches)"
                 all_node_lists.append(nl)
-                all_thinking.append(f"[{dt['filename']}] {th}")
                 total_stage1_tokens += tk
 
-                doc_map = create_node_mapping(dt["tree"])
-                doc_results.append({
-                    "doc_id": dt["doc_id"],
-                    "filename": dt["filename"],
-                    "node_list": nl,
-                    "node_map": doc_map
-                })
+                if nl:
+                    all_thinking.append(f"[{dt['filename']}] {th}")
+                    doc_map = create_node_mapping(dt["tree"])
+                    doc_results.append({
+                        "doc_id": dt["doc_id"],
+                        "filename": dt["filename"],
+                        "node_list": nl,
+                        "node_map": doc_map
+                    })
+                else:
+                    all_thinking.append(f"[{dt['filename']}] No relevant nodes found")
 
             node_list = list(set(nid for nl in all_node_lists for nid in nl))
             thinking = "\n\n".join(all_thinking)
             tokens_stage1 = total_stage1_tokens
             node_map = {}
             tree = None
+
+        if not node_list and not doc_results:
+            logger.info(f"No relevant content found for query: {request.question[:100]}")
+            used_tokens = 0
+            if doc_id and doc_id > 0:
+                try: used_tokens = tokens_stage1
+                except NameError: pass
+            else:
+                try: used_tokens = total_stage1_tokens
+                except NameError: pass
+            return QueryResponse(
+                question=request.question,
+                answer="I cannot find this in the provided documents.",
+                tokens_used=used_tokens,
+                cost=0.0,
+                cached=False,
+                num_documents_queried=num_docs
+            )
 
         # Stage 2: Answer generation (PageIndex approach)
         answer, citations, tokens_stage2 = await stage2_answer_generation(

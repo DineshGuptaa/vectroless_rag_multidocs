@@ -1,4 +1,20 @@
 services:
+  # Consul Service Discovery
+  consul:
+    image: hashicorp/consul:1.19
+    container_name: indexer-consul
+    ports:
+      - "8500:8500"
+    command: ["agent", "-dev", "-client=0.0.0.0", "-bind=0.0.0.0"]
+    networks:
+      - indexer-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8500/v1/status/leader"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # Frontend - Beautiful UI with Next.js
   frontend:
     build: ./frontend
@@ -7,8 +23,8 @@ services:
       - "3000:3000"
     volumes:
       - ./frontend:/app
-      - /app/node_modules  # Isolate node_modules in container
-      - /app/.next         # Isolate build artifacts
+      - /app/node_modules
+      - /app/.next
     environment:
       - NODE_ENV=development
       - NEXT_PUBLIC_API_URL=http://localhost:8000
@@ -26,14 +42,18 @@ services:
 
   # API Gateway - Central routing and orchestration
   api-gateway:
-    build: ./api-gateway
+    build:
+      context: .
+      dockerfile: api-gateway/Dockerfile
     container_name: indexer-gateway
     ports:
       - "8000:8000"
     volumes:
       - ./api-gateway:/app
+      - ./shared:/app/shared
     environment:
       - ENVIRONMENT=development
+      - CONSUL_HOST=consul
       - DOCUMENT_SERVICE_URL=http://document-service:8001
       - TREE_SERVICE_URL=http://tree-service:8002
       - QUERY_SERVICE_URL=http://query-service:8003
@@ -42,6 +62,7 @@ services:
       - CACHE_SERVICE_URL=http://cache-service:8006
       - SETTINGS_SERVICE_URL=http://settings-service:8007
     depends_on:
+      - consul
       - document-service
       - tree-service
       - query-service
@@ -60,18 +81,25 @@ services:
 
   # Document Service - multi-format document processing
   document-service:
-    build: ./document-service
+    build:
+      context: .
+      dockerfile: document-service/Dockerfile
     container_name: indexer-documents
     ports:
       - "8001:8001"
     volumes:
       - ./document-service:/app
+      - ./shared:/app/shared
       - uploads:/app/uploads
     environment:
       - SERVICE_NAME=document-service
       - PORT=8001
+      - CONSUL_HOST=consul
+      - CONSUL_ADVERTISE_HOST=document-service
       - MAX_FILE_SIZE_MB=100
       - SUPPORTED_FORMATS=pdf,docx,txt,md
+    depends_on:
+      - consul
     networks:
       - indexer-network
     restart: unless-stopped
@@ -83,21 +111,29 @@ services:
 
   # Tree Service - PageIndex tree generation
   tree-service:
-    build: ./tree-service
+    build:
+      context: .
+      dockerfile: tree-service/Dockerfile
     container_name: indexer-trees
     ports:
       - "8002:8002"
     volumes:
       - ./tree-service:/app
+      - ./shared:/app/shared
       - tree-data:/app/trees
     environment:
       - SERVICE_NAME=tree-service
       - PORT=8002
+      - CONSUL_HOST=consul
+      - CONSUL_ADVERTISE_HOST=tree-service
+      - STORAGE_SERVICE_URL=http://storage-service:8005
       - SETTINGS_SERVICE_URL=http://settings-service:8007
       - LLM_PROVIDER=${LLM_PROVIDER}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      - consul
     networks:
       - indexer-network
     restart: unless-stopped
@@ -109,21 +145,28 @@ services:
 
   # Query Service - Reasoning engine
   query-service:
-    build: ./query-service
+    build:
+      context: .
+      dockerfile: query-service/Dockerfile
     container_name: indexer-query
     ports:
       - "8003:8003"
     volumes:
       - ./query-service:/app
+      - ./shared:/app/shared
     environment:
       - SERVICE_NAME=query-service
       - PORT=8003
+      - CONSUL_HOST=consul
+      - CONSUL_ADVERTISE_HOST=query-service
       - SETTINGS_SERVICE_URL=http://settings-service:8007
       - CACHE_SERVICE_URL=http://cache-service:8006
       - LLM_PROVIDER=${LLM_PROVIDER}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      - consul
     networks:
       - indexer-network
     restart: unless-stopped
@@ -135,17 +178,24 @@ services:
 
   # Chat Service - WebSocket streaming
   chat-service:
-    build: ./chat-service
+    build:
+      context: .
+      dockerfile: chat-service/Dockerfile
     container_name: indexer-chat
     ports:
       - "8004:8004"
     volumes:
       - ./chat-service:/app
+      - ./shared:/app/shared
     environment:
       - SERVICE_NAME=chat-service
       - PORT=8004
+      - CONSUL_HOST=consul
+      - CONSUL_ADVERTISE_HOST=chat-service
       - SETTINGS_SERVICE_URL=http://settings-service:8007
       - QUERY_SERVICE_URL=http://query-service:8003
+    depends_on:
+      - consul
     networks:
       - indexer-network
     restart: unless-stopped
@@ -157,18 +207,25 @@ services:
 
   # Storage Service - File and data management
   storage-service:
-    build: ./storage-service
+    build:
+      context: .
+      dockerfile: storage-service/Dockerfile
     container_name: indexer-storage
     ports:
       - "8005:8005"
     volumes:
       - ./storage-service:/app
+      - ./shared:/app/shared
       - data:/app/data
       - uploads:/app/uploads
     environment:
       - SERVICE_NAME=storage-service
       - PORT=8005
+      - CONSUL_HOST=consul
+      - CONSUL_ADVERTISE_HOST=storage-service
       - DATABASE_PATH=/app/data/storage.db
+    depends_on:
+      - consul
     networks:
       - indexer-network
     restart: unless-stopped
@@ -180,18 +237,24 @@ services:
 
   # Cache Service - In-memory caching layer
   cache-service:
-    build: ./cache-service
+    build:
+      context: .
+      dockerfile: cache-service/Dockerfile
     container_name: indexer-cache
     ports:
       - "8006:8006"
     volumes:
       - ./cache-service:/app
-      # No persistent volume - ephemeral cache by design
+      - ./shared:/app/shared
     environment:
       - SERVICE_NAME=cache-service
       - PORT=8006
+      - CONSUL_HOST=consul
+      - CONSUL_ADVERTISE_HOST=cache-service
       - CACHE_TTL_DEFAULT=3600
       - MAX_CACHE_SIZE_MB=512
+    depends_on:
+      - consul
     networks:
       - indexer-network
     restart: unless-stopped
@@ -203,20 +266,27 @@ services:
 
   # Settings Service - Configuration and API key management
   settings-service:
-    build: ./settings-service
+    build:
+      context: .
+      dockerfile: settings-service/Dockerfile
     container_name: indexer-settings
     ports:
       - "8007:8007"
     volumes:
       - ./settings-service:/app
+      - ./shared:/app/shared
       - settings-data:/app/data
     environment:
       - SERVICE_NAME=settings-service
       - PORT=8007
+      - CONSUL_HOST=consul
+      - CONSUL_ADVERTISE_HOST=settings-service
       - DATABASE_PATH=/app/data/settings.db
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
       - LLM_PROVIDER=${LLM_PROVIDER}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
+    depends_on:
+      - consul
     networks:
       - indexer-network
     restart: unless-stopped
@@ -258,4 +328,3 @@ volumes:
       type: none
       o: bind
       device: ./volumes/settings
-  # Note: No cache volume - ephemeral by design!

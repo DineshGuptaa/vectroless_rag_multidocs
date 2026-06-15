@@ -143,7 +143,6 @@ export function ChatInterface({ selectedDocument, onNavigateToDocuments }: ChatI
       setMessages((prev) => [...prev, errorMessage])
       setIsLoading(false)
       setCurrentQuestionId(null)
-      setThinkingProcess(null)
       toast.error(`Query failed: ${data.message}`)
     }
 

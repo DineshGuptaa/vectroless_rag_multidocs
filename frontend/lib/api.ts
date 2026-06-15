@@ -138,19 +138,24 @@ export interface TreeSettings {
   toc_check_page_num: number
   max_page_num_each_node: number
   max_token_num_each_node: number
+  min_node_pages: number
+  max_tree_depth: number
+  max_retry: number
   if_add_node_id: boolean
   if_add_node_summary: boolean
   if_add_doc_description: boolean
   if_add_node_text: boolean
+  if_use_toc: boolean
+  if_use_ocr: boolean
 }
 
 export interface QuerySettings {
-  citation_style: 'inline' | 'footnote' | 'none'
+  citation_style: string
   cache_ttl_hours: number
 }
 
 export interface ModelConfig {
-  llm_provider?: 'openai' | 'ollama'
+  llm_provider: string
   model: string
   temperature: number
   max_tokens: number

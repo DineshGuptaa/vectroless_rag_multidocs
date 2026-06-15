@@ -160,7 +160,7 @@ export function DocumentsPanel({
         uploadDate: new Date(d.created_at),
         status: d.status,
         pageCount: d.page_count,
-        treeGenerated: !!d.tree_id,
+        treeGenerated: !!(d as any).tree_id,
       }))
       setDocuments(docs)
     } catch (error) {

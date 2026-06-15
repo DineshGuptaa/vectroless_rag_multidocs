@@ -121,7 +121,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const loadKeyStatus = async () => {
     try {
       const data = await settingsApi.getKeyStatus()
-      if (data.exists) {
+      if (data.has_key) {
         setApiKey(data.partial_key || '') // Show masked key
         setKeyStatus('valid')
       }

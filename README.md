@@ -93,6 +93,95 @@ This project implements a 9-microservice architecture, where each service has a 
 | **Cache Service**    | 8006 | Query result caching with TTL                | FastAPI, in-memory cache      |
 | **Settings Service** | 8007 | API key management, configuration storage    | FastAPI, encryption           |
 
+## Consul Service Discovery
+
+All backend services use **HashiCorp Consul** for dynamic service registration and discovery. Instead of hardcoding service URLs, each service registers itself with Consul on startup and resolves dependencies at runtime.
+
+### Capabilities
+
+| Feature | Description |
+|---|---|
+| **Service Registration** | Each microservice auto-registers with Consul on startup via `ConsulRegistry.register()` |
+| **Health Checks** | Consul polls `GET /health` on every service every 15s; unhealthy services are automatically deregistered after 1 minute |
+| **Dynamic Discovery** | Services resolve peers at runtime via `ConsulRegistry.discover()` — no hardcoded addresses |
+| **Fallback URLs** | If Consul is unreachable, services fall back to Docker Compose service names (e.g. `http://storage-service:8005`) |
+| **Fault Tolerance** | Service degradation is handled gracefully — gateway continues operating with reduced capabilities |
+| **Zero Downtime** | New service instances are discovered automatically without restarting dependencies |
+
+### Adding a New Dynamic Service
+
+To add a new microservice to the mesh:
+
+**1. Create the service with Consul registration:**
+```python
+from shared.consul_discovery import ConsulRegistry
+
+consul = ConsulRegistry(consul_host="consul")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    port = int(os.getenv("PORT", "8008"))
+    await consul.register("my-new-service", port, tags=["custom"])
+    yield
+    await consul.close()
+```
+
+**2. Resolve dependencies at startup:**
+```python
+storage_url = os.getenv("STORAGE_SERVICE_URL", "http://storage-service:8005")
+resolved = await consul.get_service_url("storage-service", storage_url)
+```
+
+**3. Add the service to `docker-compose.yml`:**
+```yaml
+my-new-service:
+  build: ./my-new-service
+  ports:
+    - "8008:8008"
+  environment:
+    - SERVICE_NAME=my-new-service
+    - PORT=8008
+    - CONSUL_HOST=consul
+  depends_on:
+    - consul
+  networks:
+    - indexer-network
+```
+
+**4. Expose through API Gateway (optional):** Add routes in `api-gateway/main.py`.
+
+The service will auto-register, get health-checked, and be discoverable by all peers — no config changes needed on dependent services.
+
+### Service Registration Flow (Per Microservice)
+
+```
+Service Startup
+    │
+    ▼
+Read PORT + CONSUL_HOST from env
+    │
+    ▼
+Register with Consul:
+  PUT /v1/agent/service/register
+  {
+    "Name": "my-service",
+    "Port": 8008,
+    "Check": {"HTTP": "/health", "Interval": "15s"}
+  }
+    │
+    ▼
+Resolve dependencies via Consul:
+  GET /v1/health/service/storage-service?passing
+    │
+    ▼
+Fall back to env var defaults if Consul unavailable
+    │
+    ▼
+Service ready — all peer URLs resolved dynamically
+```
+
+The shared module lives at `shared/consul_discovery.py` and provides the `ConsulRegistry` class used by all services.
+
 ### PageIndex Tree Generation Flow
 
 ```
